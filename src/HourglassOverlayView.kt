@@ -30,6 +30,7 @@ import kotlin.math.roundToInt
  * Left side: dynamic joystick -> D-pad (light push also holds Y = walk slowly).
  * Right side: tap = B (slash), swipe = B + direction (long slash), circle = Y + B (spin),
  * double-tap = A + direction (roll). A single tap waits briefly so a double-tap never swings first.
+ * Press and hold = grab (A); drag while holding to push or pull; let go to release (A again).
  * Touches on the game's own HUD strips pass straight through as stylus touches, and briefly
  * switch the right side to stylus so item paths, menus and map drawing work natively.
  * The top screen is shown as a minimap; tap it to swap it to the big view.
@@ -52,6 +53,8 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
         const val HUD_STRIP_TOP = 28        // DS pixels at the top of the touch screen passed through as stylus
         const val HUD_STRIP_BOTTOM = 30     // DS pixels at the bottom (right side only) passed through as stylus
         const val AUTO_STYLUS_MS = 3000L    // after a HUD tap, the right side stays in stylus mode this long
+        const val GRAB_HOLD_MS = 280L       // hold still this long on the right side to grab a block or lever
+        const val MENU_CORNER_W = 84        // DS pixels: the game's Menu tab in the bottom-left corner passes through
         const val WALK_THRESHOLD = 0.55f
         const val DEADZONE = 0.2f
         const val DIR_U = 1; const val DIR_D = 2; const val DIR_L = 4; const val DIR_R = 8
@@ -98,6 +101,7 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
     private class Track(val kind: Kind, val btn: Btn? = null) {
         val xs = ArrayList<Float>(); val ys = ArrayList<Float>()
         var t0 = SystemClock.uptimeMillis(); var turn = 0f; var len = 0f; var lastA = Float.NaN; var done = false
+        var grab = false; var gx = 0f; var gy = 0f; var grabRunnable: Runnable? = null
     }
     private val tracks = HashMap<Int, Track>()
 
@@ -270,8 +274,15 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
 
     private fun down(id: Int, x: Float, y: Float) {
         // buttons first
-        buttons.firstOrNull { hypot(x - it.cx, y - it.cy) < it.r + 8 * dp }?.let { b ->
+        buttons.firstOrNull { hypot(x - it.cx, y - it.cy) < it.r + (if (it.id == B.A) 18 else 8) * dp }?.let { b ->
             tracks[id] = Track(Kind.BUTTON, b); buttonDown(b); buzz(); return
+        }
+        // the right-hand bar is for buttons only: a near-miss low down counts as A, anything else is ignored
+        if (x > game.right) {
+            val mic = buttons.first { it.id == B.MIC }
+            if (y > mic.cy + mic.r) { val a = buttons.first { it.id == B.A }; tracks[id] = Track(Kind.BUTTON, a); buttonDown(a); buzz() }
+            else tracks[id] = Track(Kind.NONE)
+            return
         }
         // minimap swaps the screens
         if (mini.contains(x, y)) {
@@ -279,10 +290,10 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
         }
         val onBottom = bottomRect.contains(x, y)
         if (onBottom && stylusPointer == -1) {
-            val (_, dy) = toDs(x, y)
+            val (dx, dy) = toDs(x, y)
             val hudTop = dy < HUD_STRIP_TOP
-            val hudBottom = dy >= 192 - HUD_STRIP_BOTTOM && x >= split
-            val stylusHere = stylusMode || (stylusActive && x >= split) || hudTop || hudBottom
+            val hudBottom = dy >= 192 - HUD_STRIP_BOTTOM && (x >= split || dx < MENU_CORNER_W)
+            val stylusHere = stylusMode || stylusActive || hudTop || hudBottom
             if (stylusHere) {
                 if (hudTop || hudBottom) stylusUntil = SystemClock.uptimeMillis() + AUTO_STYLUS_MS
                 tracks[id] = Track(Kind.STYLUS); stylusDown(id, x, y); return
@@ -292,7 +303,16 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
             joyId = id; joyOx = x; joyOy = y; joyX = x; joyY = y; updateJoy()
             tracks[id] = Track(Kind.JOY); return
         }
-        tracks[id] = Track(Kind.GESTURE).apply { xs.add(x); ys.add(y) }
+        val t = Track(Kind.GESTURE).apply { xs.add(x); ys.add(y) }
+        tracks[id] = t
+        val r = Runnable {
+            if (tracks[id] === t && !t.done && t.len < 12 * dp) {
+                t.grab = true; t.gx = t.xs.last(); t.gy = t.ys.last()
+                pulse(Input.A, 90); buzz(); invalidate()
+            }
+        }
+        t.grabRunnable = r
+        ui.postDelayed(r, GRAB_HOLD_MS)
     }
 
     private fun move(id: Int, x: Float, y: Float) {
@@ -301,6 +321,12 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
             Kind.JOY -> { joyX = x; joyY = y; updateJoy() }
             Kind.STYLUS -> if (stylusPointer == id) stylusMove(x, y)
             Kind.GESTURE -> {
+                if (t.grab) {
+                    val ddx = x - t.gx; val ddy = y - t.gy
+                    val want = if (hypot(ddx, ddy) > 22 * dp) dirsFor(atan2(ddy, ddx)) else -1
+                    if (want != overrideDirs) { overrideToken++; overrideDirs = want; applyDpad() }
+                    return
+                }
                 if (t.done) return
                 val lx = t.xs.last(); val ly = t.ys.last(); val d = hypot(x - lx, y - ly)
                 if (d < 5 * dp) return
@@ -323,11 +349,17 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
                 if (!stylusMode && SystemClock.uptimeMillis() < stylusUntil) stylusUntil = SystemClock.uptimeMillis() + AUTO_STYLUS_MS
             }
             Kind.GESTURE -> {
+                t.grabRunnable?.let { ui.removeCallbacks(it) }
+                if (t.grab) {
+                    overrideToken++; overrideDirs = -1; applyDpad()
+                    ui.postDelayed({ pulse(Input.A, 90) }, 40)
+                    return
+                }
                 if (t.done) return
                 val sx = t.xs.first(); val sy = t.ys.first()
                 val disp = hypot(x - sx, y - sy); val dt = SystemClock.uptimeMillis() - t.t0
                 if (disp >= 30 * dp) lunge(atan2(y - sy, x - sx))
-                else if (disp < 18 * dp && dt < 350) onTap(x, y)
+                else if (disp < 18 * dp && dt < GRAB_HOLD_MS) onTap(x, y)
             }
             Kind.NONE -> {}
         }
@@ -404,6 +436,13 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
             val kx = if (d > 0) joyOx + dx / d * m * joyR else joyOx; val ky = if (d > 0) joyOy + dy / d * m * joyR else joyOy
             fill.color = if (walking) 0x80F3E6C4.toInt() else 0xBFF3E6C4.toInt()
             canvas.drawCircle(kx, ky, joyR * 0.44f, fill)
+        }
+
+        tracks.values.firstOrNull { it.grab }?.let { g ->
+            stroke.color = brass; stroke.strokeWidth = 3 * dp
+            canvas.drawCircle(g.gx, g.gy, 22 * dp, stroke)
+            text.textSize = 14 * dp; text.color = brass
+            canvas.drawText("Holding: drag to push or pull, let go to release", width / 2f, game.bottom - 18 * dp, text)
         }
 
         if (stylusActive) {
