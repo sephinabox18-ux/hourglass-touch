@@ -38,7 +38,9 @@ jobs:
           distribution: zulu
 
       - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+        run: |
+          echo "sdk.dir=$ANDROID_HOME" >> melonds/local.properties
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
       - name: Build APK
         working-directory: melonds
