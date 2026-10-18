@@ -1,0 +1,67 @@
+name: Build Hourglass Touch APK
+
+on:
+  push:
+    branches: [ '**' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  MELONDS_COMMIT: c42995caff0144f37ad9791dc9bc96d82e8a6f65
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Get this repo
+        uses: actions/checkout@v4
+        with:
+          path: ours
+
+      - name: Get melonDS Android (pinned version)
+        run: |
+          git init melonds
+          cd melonds
+          git remote add origin https://github.com/rafaelvcaetano/melonDS-android.git
+          git fetch --depth 1 origin "$MELONDS_COMMIT"
+          git checkout FETCH_HEAD
+          git submodule update --init --recursive
+
+      - name: Apply Hourglass Touch changes
+        run: python3 ours/apply.py melonds
+
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: zulu
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Build APK
+        working-directory: melonds
+        run: |
+          echo "MELONDS_KEYSTORE=$GITHUB_WORKSPACE/ours/signing/hourglass.jks" >> local.properties
+          echo "MELONDS_KEYSTORE_PASSWORD=hourglass" >> local.properties
+          echo "MELONDS_KEY_ALIAS=hourglass" >> local.properties
+          echo "MELONDS_KEY_PASSWORD=hourglass" >> local.properties
+          chmod +x ./gradlew
+          ./gradlew :app:assembleGitHubProdRelease
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp app/build/outputs/apk/gitHubProd/release/*.apk "$GITHUB_WORKSPACE/out/HourglassTouch.apk"
+
+      - name: Keep the APK on the run page
+        uses: actions/upload-artifact@v4
+        with:
+          name: HourglassTouch-apk
+          path: out/HourglassTouch.apk
+
+      - name: Publish as a release (easy phone download)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: Hourglass Touch build ${{ github.run_number }}
+          body: Download HourglassTouch.apk below and open it on your phone to install or update.
+          files: out/HourglassTouch.apk
