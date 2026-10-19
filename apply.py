@@ -44,6 +44,9 @@ edit(A,
             override fun onMenuRequested() {
                 viewModel.pauseEmulator(true)
             }
+            override fun onFrontendKey(input: me.magnum.melonds.domain.model.Input) {
+                frontendInputHandler.onKeyPress(input)
+            }
         }
 
         val layoutChangeListener = View.OnLayoutChangeListener''')
