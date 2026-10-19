@@ -27,9 +27,10 @@ import kotlin.math.roundToInt
 /**
  * Phone-native touch controls for Zelda: Phantom Hourglass (with the D-pad patch applied).
  *
- * Joystick:    fixed in the lower-left. Once your thumb is on it, it stays the joystick wherever the thumb
- *              slides. 8 directions with hysteresis; a light push walks slowly (Y).
- * Sword:       tap = slash the way Link faces; tap while moving = lunge that way (B + D-pad);
+ * Joystick:    free-floating on the left side: it appears wherever your thumb slides or rests. A quick tap
+ *              there without sliding still reaches the game (the Menu tab). 8 directions with hysteresis;
+ *              a light push walks slowly (Y). It can be hidden (Stick in the ⋯ tray); the choice is remembered.
+ * B (sword):   tap = slash the way Link faces; tap while moving = lunge that way (B + D-pad);
  *              hold until the ring fills, then let go = spin attack (Y + B).
  * A:           on its own = talk / open / pick up / grab. While moving = roll.
  * Game screen: never attacks. Taps go to the game (talk, throw at a spot, menus, the game's own buttons);
@@ -37,8 +38,10 @@ import kotlin.math.roundToInt
  *              press and hold grabs a block or lever, then slide onto an arrow and hold to keep pushing.
  *              Right after A or a grab, touches go to the game at once and repeat while held.
  * Save / Load: quick save on tap; quick load needs a short hold.
+ * Pen:         on = every touch on the game screen goes straight to the game, left side included
+ *              (charting courses, map notes, minigames). The joystick still works from the side bar.
  * FF:          fast-forward on/off (for sailing).
- * ⋯:           tray with Start, Select, Mic (hold and blow) and Lid (hold to close).
+ * ⋯:           tray with Start, Select, Mic (hold and blow), Lid (hold to close) and Stick (show/hide joystick).
  * Minimap:     the DS top screen; tap to swap it to the big view and back.
  */
 class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: AttributeSet? = null) : View(context, attrs) {
@@ -56,7 +59,10 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
 
     private companion object {
         // ---- joystick ----
-        const val JOY_RADIUS_DP = 60f
+        const val JOY_RADIUS_DP = 58f
+        const val SPLIT = 0.42f              // the left part of the screen (by width) belongs to the joystick
+        const val JOY_DECIDE_MS = 160L       // a still thumb on the left becomes the joystick after this
+        const val JOY_SLIDE_DP = 10f         // ...or as soon as it slides this far
         const val DEADZONE = 0.18f
         const val DIR_HYSTERESIS = 0.14f     // radians beyond the 22.5° sector edge before switching direction
         const val WALK_ENTER = 0.48f         // push below this to walk slowly...
@@ -87,17 +93,20 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
     private var joyR = 0f
     private var joyCx = 0f
     private var joyCy = 0f
-    private var joyZoneRight = 0f
-    private var joyZoneTop = 0f
+    private var split = 0f
+    private var trayBottom = 0f
 
-    private enum class B { A, SWORD, MIC, LID, MENU, START, SELECT, SAVE, LOAD, FF, MORE }
+    private enum class B { A, SWORD, MIC, LID, MENU, START, SELECT, SAVE, LOAD, FF, PEN, STICK, MORE }
     private class Btn(val id: B, var cx: Float = 0f, var cy: Float = 0f, var r: Float = 0f, val label: String)
     private val buttons = listOf(
         Btn(B.MENU, label = "☰"), Btn(B.SAVE, label = "Save"), Btn(B.LOAD, label = "Load"),
-        Btn(B.FF, label = "FF"), Btn(B.SWORD, label = "Sword"), Btn(B.A, label = "A"), Btn(B.MORE, label = "⋯"),
-        Btn(B.START, label = "START"), Btn(B.SELECT, label = "SEL"), Btn(B.MIC, label = "Mic"), Btn(B.LID, label = "Lid")
+        Btn(B.FF, label = "FF"), Btn(B.PEN, label = "Pen"), Btn(B.SWORD, label = "B"), Btn(B.A, label = "A"), Btn(B.MORE, label = "⋯"),
+        Btn(B.START, label = "START"), Btn(B.SELECT, label = "SEL"), Btn(B.MIC, label = "Mic"), Btn(B.LID, label = "Lid"), Btn(B.STICK, label = "Stick")
     )
-    private val trayIds = setOf(B.START, B.SELECT, B.MIC, B.LID)
+    private val trayIds = setOf(B.START, B.SELECT, B.MIC, B.LID, B.STICK)
+    private val prefs = context.getSharedPreferences("hourglass_touch", Context.MODE_PRIVATE)
+    private var stickVisible = prefs.getBoolean("stick_visible", true)
+    private var penMode = false
     private var trayOpen = false
     private var ffOn = false
     private var micInit = false
@@ -121,7 +130,7 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
     private var aWindowUntil = 0L
     private var grabUntil = 0L
 
-    private enum class Kind { BUTTON, JOY, STYLUS, PENDING, HOLDING, NONE }
+    private enum class Kind { BUTTON, JOY, STYLUS, PENDING, HOLDING, UNDECIDED, NONE }
     private class Track(var kind: Kind, val btn: Btn? = null, val sx: Float = 0f, val sy: Float = 0f, val t0: Long = 0L) {
         var cx = sx; var cy = sy
         var armed = false          // HOLDING: whether the repeat presses are active yet
@@ -169,7 +178,8 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
         place(B.MENU, rbx, 34 * dp, 22 * dp)
         place(B.SAVE, rbx - 27 * dp, 86 * dp, 21 * dp)
         place(B.LOAD, rbx + 27 * dp, 86 * dp, 21 * dp)
-        place(B.FF, rbx, h * 0.45f, 21 * dp)
+        place(B.FF, rbx, h * 0.37f, 21 * dp)
+        place(B.PEN, rbx, h * 0.37f + 50 * dp, 21 * dp)
         // Sword and A: staggered so the thumb rocks between them (Sword up-left, A down-right)
         val spread = min(34 * dp, (rightBar / 2f - 38 * dp).coerceAtLeast(16 * dp))
         place(B.SWORD, rbx - spread, h - 122 * dp, 37 * dp)
@@ -178,14 +188,11 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
         val lbx = if (miniInBar) bar / 2f else 40 * dp
         place(B.MORE, lbx, mini.bottom + 26 * dp, 16 * dp)
         val trayY = mini.bottom + 64 * dp
-        listOf(B.START, B.SELECT, B.MIC, B.LID).forEachIndexed { i, id -> place(id, lbx + (i - 1.5f) * 38 * dp, trayY, 17 * dp) }
+        listOf(B.START, B.SELECT, B.MIC, B.LID, B.STICK).forEachIndexed { i, id -> place(id, lbx + (i - 2f) * 33 * dp, trayY, 15 * dp) }
+        trayBottom = trayY + 15 * dp
 
-        // fixed joystick in the lower-left (in the side bar when there is room)
         joyR = JOY_RADIUS_DP * dp
-        joyCx = if (bar >= 2 * joyR + 24 * dp) bar / 2f else game.left + joyR + 24 * dp
-        joyCy = h - joyR - 32 * dp
-        joyZoneRight = maxOf(bar + 16 * dp, joyCx + joyR)
-        joyZoneTop = btn(B.LID).let { it.cy + it.r + 10 * dp }.coerceAtMost(joyCy - joyR)
+        split = w * SPLIT
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val ex = (200 * dp).toInt()
@@ -305,10 +312,15 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
     }
 
     // ================= joystick =================
-    private fun inJoyZone(x: Float, y: Float): Boolean =
-        hypot(x - joyCx, y - joyCy) < joyR * 1.6f || (x < joyZoneRight && y > joyZoneTop)
+    private fun startJoy(id: Int, ox: Float, oy: Float, x: Float, y: Float) {
+        joyId = id; joyCx = ox; joyCy = oy; joyX = x; joyY = y
+        updateJoy()
+    }
 
     private fun updateJoy() {
+        // the joystick follows the thumb if it goes past the edge, so it never "runs out"
+        val dx0 = joyX - joyCx; val dy0 = joyY - joyCy; val d0 = hypot(dx0, dy0)
+        if (d0 > joyR * 1.35f) { val k = (d0 - joyR * 1.35f) / d0; joyCx += dx0 * k; joyCy += dy0 * k }
         val ex = joyX - joyCx; val ey = joyY - joyCy
         val m = min(1f, hypot(ex, ey) / joyR)
         val ang = atan2(ey, ex)
@@ -351,7 +363,7 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
             }
         // 2. the bar right of the game is for buttons only: low down, the nearer of Sword and A; else ignored
         if (x > game.right) {
-            if (y > btn(B.FF).cy + btn(B.FF).r) {
+            if (y > btn(B.PEN).cy + btn(B.PEN).r) {
                 val b = listOf(btn(B.SWORD), btn(B.A)).minByOrNull { hypot(x - it.cx, y - it.cy) - it.r }!!
                 tracks[id] = Track(Kind.BUTTON, b); buttonDown(b); buzz()
             } else tracks[id] = Track(Kind.NONE)
@@ -359,13 +371,28 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
         }
         // 3. minimap swaps the screens
         if (mini.contains(x, y)) { bigMap = !bigMap; pushScreenAreas(); buzz(); tracks[id] = Track(Kind.NONE); return }
-        // 4. joystick: its zone in the lower-left; it then follows that thumb anywhere
-        if (joyId == -1 && inJoyZone(x, y)) {
-            joyId = id; joyX = x; joyY = y; updateJoy()
-            tracks[id] = Track(Kind.JOY); return
+        // 4. the side bar left of the game (below the tray): joystick straight away
+        if (x < game.left && joyId == -1) {
+            if (y > trayBottom + 6 * dp || !trayOpen) { startJoy(id, x, y, x, y); tracks[id] = Track(Kind.JOY) }
+            else tracks[id] = Track(Kind.NONE)
+            return
         }
-        // 5. the game screen
         if (!bottomRect.contains(x, y)) { tracks[id] = Track(Kind.NONE); return }
+        // 5. Pen on: everything on the game screen goes straight to the game
+        if (penMode) {
+            if (stylusPointer == -1) { tracks[id] = Track(Kind.STYLUS); stylusDown(id, x, y) } else tracks[id] = Track(Kind.NONE)
+            return
+        }
+        // 6. left side of the game screen: joystick if the thumb slides or rests, a game tap if it's quick
+        if (x < split && joyId == -1) {
+            val t = Track(Kind.UNDECIDED, sx = x, sy = y)
+            tracks[id] = t
+            val r = Runnable { if (tracks[id] === t && t.kind == Kind.UNDECIDED && joyId == -1) { t.kind = Kind.JOY; startJoy(id, t.sx, t.sy, t.cx, t.cy); invalidate() } }
+            t.timer = r
+            ui.postDelayed(r, JOY_DECIDE_MS)
+            return
+        }
+        // 7. the rest of the game screen
         val now = SystemClock.uptimeMillis()
         val t = Track(Kind.PENDING, sx = x, sy = y, t0 = now)
         tracks[id] = t
@@ -385,6 +412,13 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
             Kind.JOY -> if (joyId == id) { joyX = x; joyY = y; updateJoy() }
             Kind.STYLUS -> if (stylusPointer == id) stylusMove(x, y)
             Kind.HOLDING -> { t.cx = x; t.cy = y }
+            Kind.UNDECIDED -> {
+                t.cx = x; t.cy = y
+                if (hypot(x - t.sx, y - t.sy) > JOY_SLIDE_DP * dp && joyId == -1) {
+                    t.timer?.let { ui.removeCallbacks(it) }
+                    t.kind = Kind.JOY; startJoy(id, t.sx, t.sy, x, y)
+                }
+            }
             Kind.PENDING -> {
                 t.cx = x; t.cy = y
                 if (hypot(x - t.sx, y - t.sy) >= TAP_DP * dp) {
@@ -404,6 +438,10 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
             Kind.JOY -> if (joyId == id) releaseJoy()
             Kind.STYLUS -> if (stylusPointer == id) stylusUp()
             Kind.PENDING -> {
+                t.timer?.let { ui.removeCallbacks(it) }
+                stylusTap(t.sx, t.sy)
+            }
+            Kind.UNDECIDED -> {
                 t.timer?.let { ui.removeCallbacks(it) }
                 stylusTap(t.sx, t.sy)
             }
@@ -430,6 +468,8 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
             }
             B.FF -> { ffOn = !ffOn; host?.onFrontendKey(Input.FAST_FORWARD) }
             B.MORE -> trayOpen = !trayOpen
+            B.PEN -> penMode = !penMode
+            B.STICK -> { stickVisible = !stickVisible; prefs.edit().putBoolean("stick_visible", stickVisible).apply() }
             B.START -> press(Input.START)
             B.SELECT -> press(Input.SELECT)
             B.MIC -> MelonEmulator.setMicrophoneEnabled(true)
@@ -488,13 +528,14 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
 
         for (b in buttons) {
             if (!visible(b)) continue
-            val active = tracks.values.any { it.btn === b } || (b.id == B.FF && ffOn) || (b.id == B.MORE && trayOpen)
+            val active = tracks.values.any { it.btn === b } || (b.id == B.FF && ffOn) || (b.id == B.MORE && trayOpen) ||
+                (b.id == B.PEN && penMode) || (b.id == B.STICK && stickVisible)
             fill.color = if (active) brass else ink
             canvas.drawCircle(b.cx, b.cy, b.r, fill)
             stroke.color = cream; stroke.strokeWidth = 2 * dp
             canvas.drawCircle(b.cx, b.cy, b.r, stroke)
             text.color = if (active) 0xFF12324A.toInt() else cream
-            text.textSize = when (b.id) { B.A -> 24 * dp; B.SWORD -> 14 * dp; else -> if (b.label.length > 3) 10 * dp else 13 * dp }
+            text.textSize = when (b.id) { B.A, B.SWORD -> 24 * dp; else -> if (b.label.length > 3) 10 * dp else 13 * dp }
             canvas.drawText(b.label, b.cx, b.cy - (text.descent() + text.ascent()) / 2, text)
             if (b.id == B.LOAD && loadStart != 0L) ring(canvas, b, loadStart, LOAD_HOLD_MS)
             if (b.id == B.SWORD && swordStart != 0L) ring(canvas, b, swordStart, SPIN_CHARGE_MS)
@@ -506,18 +547,17 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
             canvas.drawCircle(g.cx, g.cy, 24 * dp, stroke)
         }
 
-        // fixed joystick: always visible, knob follows the thumb
-        val on = joyId != -1
-        fill.color = if (on) 0x26F3E6C4 else 0x14F3E6C4
-        canvas.drawCircle(joyCx, joyCy, joyR, fill)
-        stroke.color = if (on) 0x99F3E6C4.toInt() else 0x59F3E6C4; stroke.strokeWidth = 2 * dp
-        canvas.drawCircle(joyCx, joyCy, joyR, stroke)
-        var kx = joyCx; var ky = joyCy
-        if (on) {
+        // floating joystick: drawn where the thumb is, unless hidden
+        if (joyId != -1 && stickVisible) {
+            fill.color = 0x26F3E6C4
+            canvas.drawCircle(joyCx, joyCy, joyR, fill)
+            stroke.color = 0x99F3E6C4.toInt(); stroke.strokeWidth = 2 * dp
+            canvas.drawCircle(joyCx, joyCy, joyR, stroke)
             val dx = joyX - joyCx; val dy = joyY - joyCy; val d = hypot(dx, dy)
+            var kx = joyCx; var ky = joyCy
             if (d > 0f) { val m = min(1f, d / joyR); kx = joyCx + dx / d * m * joyR; ky = joyCy + dy / d * m * joyR }
+            fill.color = if (walking) 0x99F3E6C4.toInt() else 0xD9F3E6C4.toInt()
+            canvas.drawCircle(kx, ky, joyR * 0.44f, fill)
         }
-        fill.color = if (!on) 0x66F3E6C4 else if (walking) 0x99F3E6C4.toInt() else 0xD9F3E6C4.toInt()
-        canvas.drawCircle(kx, ky, joyR * 0.44f, fill)
     }
 }
