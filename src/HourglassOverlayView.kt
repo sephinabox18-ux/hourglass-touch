@@ -20,32 +20,25 @@ import me.magnum.melonds.domain.model.Rect
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.atan2
-import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.min
 import kotlin.math.roundToInt
-import kotlin.math.sin
 
 /**
  * Phone-native touch controls for Zelda: Phantom Hourglass (with the D-pad patch applied).
  *
  * Joystick:    fixed in the lower-left. Once your thumb is on it, it stays the joystick wherever the thumb
- *              slides, even onto the game. 8 directions with hysteresis so it doesn't flicker between
- *              them; a light push walks slowly (Y).
- * Game screen: weapons only, never movement.
- *              Fast flick  -> a short slash stroke is drawn beside Link, so he attacks that way
- *                             (the game aims slashes by where you draw relative to Link).
- *              Tap         -> slash the way Link faces. Double-tap -> spin (Y + B).
- *              Slow drag   -> straight to the game: item paths, sailing routes, map notes.
- *              Press and hold -> grabs what's under your finger (a block, a lever); keep holding and slide
- *                             onto the arrow you want, and it keeps pushing or pulling until you let go.
- *              Taps on the game's own buttons (top and bottom edges), taps for a few seconds after
- *              that (menus), and touches right after A (throw target, block arrows) go straight to the game.
- *              Flicks always attack, wherever they start.
- * A button:    on its own = talk / open / pick up / grab. While moving = roll.
- * Save / Load: quick save on tap; quick load needs a short hold so it can't happen by accident.
+ *              slides. 8 directions with hysteresis; a light push walks slowly (Y).
+ * Sword:       tap = slash the way Link faces; tap while moving = lunge that way (B + D-pad);
+ *              hold until the ring fills, then let go = spin attack (Y + B).
+ * A:           on its own = talk / open / pick up / grab. While moving = roll.
+ * Game screen: never attacks. Taps go to the game (talk, throw at a spot, menus, the game's own buttons);
+ *              slides go to the game (item paths, sailing routes, map notes);
+ *              press and hold grabs a block or lever, then slide onto an arrow and hold to keep pushing.
+ *              Right after A or a grab, touches go to the game at once and repeat while held.
+ * Save / Load: quick save on tap; quick load needs a short hold.
  * FF:          fast-forward on/off (for sailing).
- * ⋯:           opens the tray with Start, Select, Mic (hold and blow) and Lid (hold to close).
+ * ⋯:           tray with Start, Select, Mic (hold and blow) and Lid (hold to close).
  * Minimap:     the DS top screen; tap to swap it to the big view and back.
  */
 class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: AttributeSet? = null) : View(context, attrs) {
@@ -68,33 +61,19 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
         const val DIR_HYSTERESIS = 0.14f     // radians beyond the 22.5° sector edge before switching direction
         const val WALK_ENTER = 0.48f         // push below this to walk slowly...
         const val WALK_EXIT = 0.60f          // ...and past this to run again
-        // ---- attacks ----
-        const val FLICK_MS = 180L            // a slide this fast counts as an attack flick...
-        const val FLICK_DP = 18f             // ...if it travels at least this far (dp)
-        const val LATE_FLICK_MS = 280L       // a quick release after a short slide still counts as a flick
-        const val TAP_DP = 12f
-        const val DRAW_DP = 12f              // a slower slide past this distance is a drawing for the game
-        const val DOUBLE_TAP_MS = 220L       // window for the second tap of a double-tap (spin)
-        // ---- the game's own buttons and menus ----
-        const val HUD_STRIP_TOP = 28         // DS pixels along the top edge
-        const val HUD_STRIP_BOTTOM = 30      // DS pixels along the bottom edge
-        const val RAW_KEEP_MS = 6000L        // after tapping a game button, taps go to the game this long
-        const val A_WINDOW_MS = 8000L        // after A (standing still), touches go to the game (throws, block arrows)
+        // ---- sword ----
+        const val SPIN_CHARGE_MS = 450L      // hold the sword this long, then let go, to spin
+        const val SLASH_PRESS_MS = 90L
+        // ---- game screen ----
+        const val TAP_DP = 12f               // a touch that moves less than this is a tap
+        const val TAP_HOLD_MS = 60L
         const val HOLD_MS = 320L             // press and hold this long (without sliding) to grab
         const val REPEAT_MS = 230L           // while holding on a block arrow, it is pressed again this often
         const val GRAB_SLIDE_DP = 18f        // after grabbing, slide this far onto an arrow before repeating starts
         const val GRAB_KEEP_MS = 3000L       // after letting go of a grab, the next touch carries on pushing
+        const val A_WINDOW_MS = 8000L        // after A (standing still), touches go to the game at once
         const val LOAD_HOLD_MS = 600L        // hold Load this long to quick load
-        const val TAP_HOLD_MS = 60L
-        // ---- the slash stroke drawn beside Link ----
-        const val LINK_X = 128f              // where Link usually is on the DS touch screen
-        const val LINK_Y = 92f
-        const val SLASH_REACH = 22f          // DS pixels from Link to the middle of the stroke
-        const val SLASH_HALF = 14f           // half the stroke length (drawn across the attack direction)
-        const val SLASH_STEPS = 5
-        const val SLASH_STEP_MS = 17L        // about one frame per step
-        const val SYNTH = -3                 // pointer id used for drawn strokes
-        const val TAP_ID = -2                // pointer id used for passed-through taps
+        const val TAP_ID = -2
         const val DIR_U = 1; const val DIR_D = 2; const val DIR_L = 4; const val DIR_R = 8
     }
 
@@ -111,11 +90,11 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
     private var joyZoneRight = 0f
     private var joyZoneTop = 0f
 
-    private enum class B { A, MIC, LID, MENU, START, SELECT, SAVE, LOAD, FF, MORE }
+    private enum class B { A, SWORD, MIC, LID, MENU, START, SELECT, SAVE, LOAD, FF, MORE }
     private class Btn(val id: B, var cx: Float = 0f, var cy: Float = 0f, var r: Float = 0f, val label: String)
     private val buttons = listOf(
         Btn(B.MENU, label = "☰"), Btn(B.SAVE, label = "Save"), Btn(B.LOAD, label = "Load"),
-        Btn(B.FF, label = "FF"), Btn(B.A, label = "A"), Btn(B.MORE, label = "⋯"),
+        Btn(B.FF, label = "FF"), Btn(B.SWORD, label = "Sword"), Btn(B.A, label = "A"), Btn(B.MORE, label = "⋯"),
         Btn(B.START, label = "START"), Btn(B.SELECT, label = "SEL"), Btn(B.MIC, label = "Mic"), Btn(B.LID, label = "Lid")
     )
     private val trayIds = setOf(B.START, B.SELECT, B.MIC, B.LID)
@@ -123,6 +102,8 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
     private var ffOn = false
     private var micInit = false
     private var loadStart = 0L
+    private var swordStart = 0L
+    private var swordCharged = false
     private fun btn(id: B) = buttons.first { it.id == id }
     private fun visible(b: Btn) = b.id !in trayIds || trayOpen
 
@@ -135,14 +116,8 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
     private var joyDirs = 0
     private var appliedDirs = 0
     private var walking = false
-    private var facing = (PI / 2).toFloat()   // the way Link last moved or attacked (screen angle)
 
     private var stylusPointer = -1
-    private var queuedAttack: Float? = null
-    private var pendingTap: Runnable? = null
-    private var lastTapX = 0f
-    private var lastTapY = 0f
-    private var rawUntil = 0L
     private var aWindowUntil = 0L
     private var grabUntil = 0L
 
@@ -188,13 +163,17 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
         val ml = if (miniInBar) (bar - mw) / 2f else game.left + m
         mini.set(ml, m, ml + mw, m + mh)
 
-        val rbx = if (w - game.right >= 84 * dp) (game.right + w) / 2f else w - 44 * dp
+        val rightBar = w - game.right
+        val rbx = if (rightBar >= 84 * dp) (game.right + w) / 2f else w - 44 * dp
         fun place(id: B, x: Float, y: Float, r: Float) { btn(id).apply { cx = x; cy = y; this.r = r } }
         place(B.MENU, rbx, 34 * dp, 22 * dp)
         place(B.SAVE, rbx - 27 * dp, 86 * dp, 21 * dp)
         place(B.LOAD, rbx + 27 * dp, 86 * dp, 21 * dp)
-        place(B.FF, rbx, h * 0.5f, 22 * dp)
-        place(B.A, rbx, h - 58 * dp, 40 * dp)
+        place(B.FF, rbx, h * 0.45f, 21 * dp)
+        // Sword and A: staggered so the thumb rocks between them (Sword up-left, A down-right)
+        val spread = min(34 * dp, (rightBar / 2f - 38 * dp).coerceAtLeast(16 * dp))
+        place(B.SWORD, rbx - spread, h - 122 * dp, 37 * dp)
+        place(B.A, rbx + spread, h - 50 * dp, 34 * dp)
         // left bar: the ⋯ tray button under the minimap, and the tray row below it
         val lbx = if (miniInBar) bar / 2f else 40 * dp
         place(B.MORE, lbx, mini.bottom + 26 * dp, 16 * dp)
@@ -231,6 +210,7 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
     // ================= keys =================
     private fun press(i: Input) { if (held[i.ordinal]++ == 0) MelonEmulator.onInputDown(i) }
     private fun release(i: Input) { if (held[i.ordinal] > 0 && --held[i.ordinal] == 0) MelonEmulator.onInputUp(i) }
+    private fun pulse(i: Input, ms: Long) { press(i); ui.postDelayed({ release(i) }, ms) }
 
     private fun applyDpad() {
         val want = joyDirs
@@ -250,7 +230,8 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
     }
     private fun angleDiff(a: Float, b: Float): Float {
         var d = (a - b) % (2 * PI).toFloat()
-        if (d > PI) d -= (2 * PI).toFloat(); if (d < -PI) d += (2 * PI).toFloat()
+        if (d > PI) d -= (2 * PI).toFloat()
+        if (d < -PI) d += (2 * PI).toFloat()
         return abs(d)
     }
 
@@ -263,10 +244,6 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
         val dy = ((y - r.top) / r.height() * 192f).toInt().coerceIn(0, 191)
         return dx to dy
     }
-    private fun isHud(x: Float, y: Float): Boolean {
-        if (!bottomRect.contains(x, y)) return false
-        val (_, dy) = toDs(x, y); return dy < HUD_STRIP_TOP || dy >= 192 - HUD_STRIP_BOTTOM
-    }
     private fun stylusDown(id: Int, x: Float, y: Float) {
         stylusPointer = id
         val (dx, dy) = toDs(x, y)
@@ -276,7 +253,6 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
     private fun stylusUp() {
         stylusPointer = -1
         MelonEmulator.onInputUp(Input.TOUCHSCREEN); MelonEmulator.onScreenRelease()
-        queuedAttack?.let { a -> queuedAttack = null; ui.postDelayed({ slashToward(a) }, 34) }
     }
     /** A short real touch at that spot. */
     private fun stylusTap(x: Float, y: Float) {
@@ -285,72 +261,33 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
         ui.postDelayed({ if (stylusPointer == TAP_ID) stylusUp() }, TAP_HOLD_MS)
     }
 
-    // ================= attacks =================
-    /** Draws a short, fast stroke across the space beside Link, so the game slashes toward [angle]. */
-    private fun slashToward(angle: Float) {
-        facing = angle
-        if (stylusPointer == SYNTH) { queuedAttack = angle; return }   // chain it right after the current one
-        if (stylusPointer != -1) return
-        val cx = LINK_X + cos(angle) * SLASH_REACH; val cy = LINK_Y + sin(angle) * SLASH_REACH
-        val px = -sin(angle); val py = cos(angle)
-        stylusPointer = SYNTH
-        for (i in 0..SLASH_STEPS) {
-            val k = -1f + 2f * i / SLASH_STEPS
-            val sx = (cx + px * SLASH_HALF * k).roundToInt().coerceIn(0, 255)
-            val sy = (cy + py * SLASH_HALF * k).roundToInt().coerceIn(0, 191)
-            ui.postDelayed({
-                if (stylusPointer == SYNTH) {
-                    if (i == 0) MelonEmulator.onInputDown(Input.TOUCHSCREEN)
-                    MelonEmulator.onScreenTouch(sx, sy)
-                }
-            }, i * SLASH_STEP_MS)
+    // ================= sword =================
+    private fun swordDown() {
+        swordStart = SystemClock.uptimeMillis(); swordCharged = false
+        ui.postDelayed({
+            if (swordStart != 0L && tracks.values.any { it.btn?.id == B.SWORD }) { swordCharged = true; buzz(); invalidate() }
+        }, SPIN_CHARGE_MS)
+        postInvalidateOnAnimation()
+    }
+    private fun swordUp() {
+        if (swordStart == 0L) return
+        val charged = swordCharged || SystemClock.uptimeMillis() - swordStart >= SPIN_CHARGE_MS
+        swordStart = 0L; swordCharged = false
+        if (charged) {
+            // spin: Y + B
+            press(Input.Y)
+            ui.postDelayed({ press(Input.B) }, 34)
+            ui.postDelayed({ release(Input.B) }, 190)
+            ui.postDelayed({ release(Input.Y) }, 260)
+        } else {
+            // slash: B (with the joystick held, the D-pad patch makes this a lunge that way)
+            pulse(Input.B, SLASH_PRESS_MS)
         }
-        ui.postDelayed({ if (stylusPointer == SYNTH) stylusUp() }, (SLASH_STEPS + 1) * SLASH_STEP_MS)
         buzz()
-    }
-
-    private fun spin() {
-        queuedAttack = null
-        press(Input.Y)
-        ui.postDelayed({ press(Input.B) }, 34)
-        ui.postDelayed({ release(Input.B) }, 190)
-        ui.postDelayed({ release(Input.Y) }, 260)
-        buzz()
-    }
-
-    private fun flick(angle: Float) {
-        cancelPendingTap()
-        slashToward(angle)
-    }
-
-    private fun cancelPendingTap() { pendingTap?.let { ui.removeCallbacks(it); pendingTap = null } }
-
-    /** A tap on the game screen. */
-    private fun tap(x: Float, y: Float) {
-        val now = SystemClock.uptimeMillis()
-        val hud = isHud(x, y)
-        // game buttons, and menus right after them, go straight to the game
-        if (hud || now < rawUntil) {
-            cancelPendingTap()
-            stylusTap(x, y)
-            rawUntil = now + RAW_KEEP_MS
-            return
-        }
-        // otherwise: a sword tap, or the second half of a double-tap (spin)
-        val p = pendingTap
-        if (p != null && hypot(x - lastTapX, y - lastTapY) < 100 * dp) {
-            ui.removeCallbacks(p); pendingTap = null
-            spin(); return
-        }
-        lastTapX = x; lastTapY = y
-        val r = Runnable { pendingTap = null; slashToward(facing) }
-        pendingTap = r
-        ui.postDelayed(r, DOUBLE_TAP_MS)
     }
 
     // ================= grab and push =================
     private fun startHolding(id: Int, t: Track, fromWindow: Boolean) {
-        cancelPendingTap()
         t.kind = Kind.HOLDING; t.fromWindow = fromWindow
         if (fromWindow) { t.armed = true; stylusTap(t.cx, t.cy) }
         else { stylusTap(t.sx, t.sy); buzz() }            // the grab
@@ -385,7 +322,6 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
         }
         if (newWalk != walking) { walking = newWalk; if (walking) press(Input.Y) else release(Input.Y) }
         if (newDirs != joyDirs) { joyDirs = newDirs; applyDpad() }
-        if (joySector >= 0) facing = (joySector * PI / 4).toFloat()
     }
     private fun releaseJoy() {
         joyId = -1; joySector = -1; joyDirs = 0; applyDpad()
@@ -407,14 +343,18 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
 
     private fun down(id: Int, x: Float, y: Float) {
         if (!micInit) { micInit = true; MelonEmulator.setMicrophoneEnabled(false) }   // mic only while Mic is held
-        // 1. buttons (A gets a generous touch area)
-        buttons.firstOrNull { visible(it) && hypot(x - it.cx, y - it.cy) < it.r + (if (it.id == B.A) 18 else 8) * dp }?.let { b ->
-            tracks[id] = Track(Kind.BUTTON, b); buttonDown(b); buzz(); return
-        }
-        // 2. the bar right of the game is for buttons only: low down counts as A, anything else is ignored
+        // 1. buttons (Sword and A get generous touch areas)
+        val big = setOf(B.A, B.SWORD)
+        buttons.filter { visible(it) && hypot(x - it.cx, y - it.cy) < it.r + (if (it.id in big) 14 else 8) * dp }
+            .minByOrNull { hypot(x - it.cx, y - it.cy) - it.r }?.let { b ->
+                tracks[id] = Track(Kind.BUTTON, b); buttonDown(b); buzz(); return
+            }
+        // 2. the bar right of the game is for buttons only: low down, the nearer of Sword and A; else ignored
         if (x > game.right) {
-            if (y > btn(B.FF).cy + btn(B.FF).r) { val a = btn(B.A); tracks[id] = Track(Kind.BUTTON, a); buttonDown(a); buzz() }
-            else tracks[id] = Track(Kind.NONE)
+            if (y > btn(B.FF).cy + btn(B.FF).r) {
+                val b = listOf(btn(B.SWORD), btn(B.A)).minByOrNull { hypot(x - it.cx, y - it.cy) - it.r }!!
+                tracks[id] = Track(Kind.BUTTON, b); buttonDown(b); buzz()
+            } else tracks[id] = Track(Kind.NONE)
             return
         }
         // 3. minimap swaps the screens
@@ -431,7 +371,7 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
         tracks[id] = t
         // right after A or a grab: the touch goes to the game at once (throw target, block arrows), repeating while held
         if ((now < aWindowUntil || now < grabUntil) && stylusPointer == -1) { startHolding(id, t, fromWindow = true); return }
-        // otherwise weapons, decided by how the finger moves; holding still grabs
+        // otherwise: a tap, a slide (drawing), or a hold (grab)
         val r = Runnable {
             if (tracks[id] === t && t.kind == Kind.PENDING && hypot(t.cx - t.sx, t.cy - t.sy) < TAP_DP * dp && stylusPointer == -1) startHolding(id, t, fromWindow = false)
         }
@@ -447,12 +387,9 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
             Kind.HOLDING -> { t.cx = x; t.cy = y }
             Kind.PENDING -> {
                 t.cx = x; t.cy = y
-                val d = hypot(x - t.sx, y - t.sy); val el = SystemClock.uptimeMillis() - t.t0
-                if (el <= FLICK_MS && d >= FLICK_DP * dp) {
-                    t.kind = Kind.NONE; flick(atan2(y - t.sy, x - t.sx))
-                } else if (el > FLICK_MS && d >= DRAW_DP * dp) {
-                    // a slower slide: a drawing for the game (item paths, sailing routes, map notes)
-                    cancelPendingTap()
+                if (hypot(x - t.sx, y - t.sy) >= TAP_DP * dp) {
+                    // a slide: goes to the game as a drawing (item paths, sailing routes, map notes)
+                    t.timer?.let { ui.removeCallbacks(it) }
                     if (stylusPointer == -1) { t.kind = Kind.STYLUS; stylusDown(id, t.sx, t.sy); stylusMove(x, y) } else t.kind = Kind.NONE
                 }
             }
@@ -465,23 +402,17 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
         when (t.kind) {
             Kind.BUTTON -> t.btn?.let { buttonUp(it) }
             Kind.JOY -> if (joyId == id) releaseJoy()
-            Kind.STYLUS -> {
-                if (stylusPointer == id) stylusUp()
-                val now = SystemClock.uptimeMillis()
-                if (now < rawUntil) rawUntil = now + RAW_KEEP_MS
-            }
+            Kind.STYLUS -> if (stylusPointer == id) stylusUp()
             Kind.PENDING -> {
                 t.timer?.let { ui.removeCallbacks(it) }
-                val d = hypot(x - t.sx, y - t.sy); val el = SystemClock.uptimeMillis() - t.t0
-                if (d < TAP_DP * dp) tap(t.sx, t.sy)
-                else if (el <= LATE_FLICK_MS) flick(atan2(y - t.sy, x - t.sx))
+                stylusTap(t.sx, t.sy)
             }
             Kind.HOLDING -> {
                 t.timer?.let { ui.removeCallbacks(it) }
                 val now = SystemClock.uptimeMillis()
-                // a quick touch right after A was a throw: back to the sword. A held push keeps the grab going.
-                if (t.fromWindow && now - t.t0 < HOLD_MS) { aWindowUntil = 0L; grabUntil = 0L }
-                else { aWindowUntil = 0L; grabUntil = now + GRAB_KEEP_MS }
+                // a quick touch right after A was a throw: done. A held push keeps the grab going a moment.
+                aWindowUntil = 0L
+                grabUntil = if (t.fromWindow && now - t.t0 < HOLD_MS) 0L else now + GRAB_KEEP_MS
             }
             Kind.NONE -> {}
         }
@@ -490,6 +421,7 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
     private fun buttonDown(b: Btn) {
         when (b.id) {
             B.A -> { press(Input.A); if (joyDirs == 0) aWindowUntil = SystemClock.uptimeMillis() + A_WINDOW_MS }
+            B.SWORD -> swordDown()
             B.SAVE -> host?.onFrontendKey(Input.QUICK_SAVE)
             B.LOAD -> {
                 loadStart = SystemClock.uptimeMillis()
@@ -509,6 +441,7 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
     private fun buttonUp(b: Btn) {
         when (b.id) {
             B.A -> release(Input.A)
+            B.SWORD -> swordUp()
             B.START -> release(Input.START)
             B.SELECT -> release(Input.SELECT)
             B.MIC -> MelonEmulator.setMicrophoneEnabled(false)
@@ -519,10 +452,10 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
     }
 
     private fun releaseAll() {
-        for ((_, t) in tracks) if (t.kind == Kind.BUTTON) t.btn?.let { buttonUp(it) }
+        for ((_, t) in tracks) if (t.kind == Kind.BUTTON && t.btn?.id != B.SWORD) t.btn?.let { buttonUp(it) }
         tracks.clear()
         ui.removeCallbacksAndMessages(null)
-        pendingTap = null; queuedAttack = null; loadStart = 0L
+        loadStart = 0L; swordStart = 0L; swordCharged = false
         if (stylusPointer != -1) { stylusPointer = -1; MelonEmulator.onInputUp(Input.TOUCHSCREEN); MelonEmulator.onScreenRelease() }
         joyId = -1; joySector = -1; joyDirs = 0; applyDpad()
         walking = false
@@ -541,6 +474,13 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
     }
 
     // ================= drawing =================
+    private fun ring(canvas: Canvas, b: Btn, start: Long, total: Long) {
+        val k = ((SystemClock.uptimeMillis() - start).toFloat() / total).coerceIn(0f, 1f)
+        stroke.color = brass; stroke.strokeWidth = 4 * dp
+        canvas.drawArc(b.cx - b.r - 5 * dp, b.cy - b.r - 5 * dp, b.cx + b.r + 5 * dp, b.cy + b.r + 5 * dp, -90f, 360f * k, false, stroke)
+        if (k < 1f) postInvalidateOnAnimation()
+    }
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
         stroke.color = cream; stroke.strokeWidth = 3 * dp
@@ -554,14 +494,10 @@ class HourglassOverlayView @JvmOverloads constructor(context: Context, attrs: At
             stroke.color = cream; stroke.strokeWidth = 2 * dp
             canvas.drawCircle(b.cx, b.cy, b.r, stroke)
             text.color = if (active) 0xFF12324A.toInt() else cream
-            text.textSize = when { b.label.length > 3 -> 10 * dp; b.id == B.A -> 24 * dp; else -> 13 * dp }
+            text.textSize = when (b.id) { B.A -> 24 * dp; B.SWORD -> 14 * dp; else -> if (b.label.length > 3) 10 * dp else 13 * dp }
             canvas.drawText(b.label, b.cx, b.cy - (text.descent() + text.ascent()) / 2, text)
-            if (b.id == B.LOAD && loadStart != 0L) {
-                val k = ((SystemClock.uptimeMillis() - loadStart).toFloat() / LOAD_HOLD_MS).coerceIn(0f, 1f)
-                stroke.color = brass; stroke.strokeWidth = 4 * dp
-                canvas.drawArc(b.cx - b.r - 4 * dp, b.cy - b.r - 4 * dp, b.cx + b.r + 4 * dp, b.cy + b.r + 4 * dp, -90f, 360f * k, false, stroke)
-                postInvalidateOnAnimation()
-            }
+            if (b.id == B.LOAD && loadStart != 0L) ring(canvas, b, loadStart, LOAD_HOLD_MS)
+            if (b.id == B.SWORD && swordStart != 0L) ring(canvas, b, swordStart, SPIN_CHARGE_MS)
         }
 
         // grab ring under the finger while holding a block or lever
